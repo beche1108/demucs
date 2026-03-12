@@ -104,8 +104,29 @@ for more details.
 
 ## Requirements
 
-You will need at least Python 3.8. See `requirements_minimal.txt` for requirements for separation only,
-and `environment-[cpu|cuda].yml` (or `requirements.txt`) if you want to train a new model.
+This fork is aligned with the `voice-lab` workspace baseline on Python 3.12.
+If you are installing `demucs` together with `FireRedVAD`, create the environment from the workspace root:
+
+```bash
+uv python install 3.12
+uv venv --python 3.12
+.venv\Scripts\activate
+uv sync --extra cpu
+```
+
+For GPU on Windows with a CUDA 12.8 baseline:
+
+```bash
+uv python install 3.12
+uv venv --python 3.12
+.venv\Scripts\activate
+uv sync --extra gpu
+uv pip install --reinstall torch torchaudio --index-url https://download.pytorch.org/whl/cu128
+```
+
+If you are using `demucs` by itself, use Python 3.12 or newer. See `requirements_minimal.txt` for
+requirements for separation only, and `environment-[cpu|cuda].yml` (or `requirements.txt`) if you
+want to train a new model.
 
 ### For Windows users
 

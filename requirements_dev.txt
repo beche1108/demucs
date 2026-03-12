@@ -1,0 +1,9 @@
+-r requirements.txt
+diffq>=0.2.1
+flake8
+hydra-colorlog>=1.1
+hydra-core>=1.1
+museval
+mypy
+submitit
+treetable

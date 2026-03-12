@@ -1,5 +1,7 @@
 *.egg-info
 __pycache__
+.venv
+/out
 Session.vim
 /build
 /dist
