@@ -87,6 +87,10 @@ def _segment_duration(seg: dict) -> float:
     return max(0.0, float(seg["end"]) - float(seg["start"]))
 
 
+def _manifest_relative_path(path: Path, base_dir: Path) -> str:
+    return path.relative_to(base_dir).as_posix()
+
+
 def _resolve_output_sample_rate(audio_stream, configured_sample_rate: Optional[int]) -> int:
     if configured_sample_rate is not None:
         rate = int(configured_sample_rate)
@@ -400,7 +404,7 @@ class EnhancedPipeline:
                             sample_rate,
                         ),
                         path_field="vocals_path",
-                        relative_path=str(dest.relative_to(output_dir)),
+                        relative_path=_manifest_relative_path(dest, output_dir),
                         extra_fields={
                             "vocals_rms": _compute_rms(vocals_np, "passthrough audio"),
                         },
@@ -431,7 +435,7 @@ class EnhancedPipeline:
                     sample_rate,
                 ),
                 path_field="vocals_path",
-                relative_path=str(vocals_path.relative_to(output_dir)),
+                relative_path=_manifest_relative_path(vocals_path, output_dir),
                 extra_fields={
                     "vocals_rms": _compute_rms(vocals_np, "vocals output"),
                 },
@@ -451,7 +455,7 @@ class EnhancedPipeline:
                             sample_rate,
                         ),
                         path_field=f"{stem_name}_path",
-                        relative_path=str(stem_path.relative_to(output_dir)),
+                        relative_path=_manifest_relative_path(stem_path, output_dir),
                         extra_fields={
                             f"{stem_name}_rms": _compute_rms(
                                 stem_audio,
