@@ -7,6 +7,7 @@ import json
 import logging
 import os
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -1067,8 +1068,17 @@ class EnhancedPipeline:
             result_segments.append(seg_entry)
 
     def process(self, segments_json_path: str, output_dir: str,
-                input_path: str | None = None) -> dict:
+                input_path: str | None = None,
+                progress_callback: Callable[..., None] | None = None) -> dict:
         """Process FireRedVAD segments using Demucs on the original media file."""
+        def report_progress(event_type: str, **payload) -> None:
+            if progress_callback is None:
+                return
+            try:
+                progress_callback(event_type, **payload)
+            except Exception:
+                return
+
         segments_json_path = Path(segments_json_path)
         output_dir = Path(output_dir)
         segments_dir = output_dir / "segments"
@@ -1098,6 +1108,8 @@ class EnhancedPipeline:
         reusable_merge_groups: dict[int, dict] = {}
         reused_merge_group_ids: set[int] = set()
         resumed_segments = 0
+        processed_segments = 0
+        pending_error_segments = 0
 
         container = av.open(str(input_path))
         audio_stream = next(iter(container.streams.audio), None)
@@ -1113,6 +1125,10 @@ class EnhancedPipeline:
             timeline=timeline,
             output_dir=output_dir,
             resolved_output_sample_rate=resolved_output_sample_rate,
+        )
+        report_progress(
+            "demucs_started",
+            total_segments=len(timeline),
         )
 
         write_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
@@ -1143,15 +1159,33 @@ class EnhancedPipeline:
                         for segment_id in group_segment_ids:
                             result_segments.append(copy.deepcopy(reusable_segments[segment_id]))
                             resumed_segments += 1
-                        self.logger.info(
-                            "Resume reused merge group %s with %d segment(s) [%.3f - %.3f]",
-                            resolved_group_id if resolved_group_id is not None else "?",
-                            len(group_segment_ids),
-                            group.start_s,
-                            group.end_s,
+                        if progress_callback is None:
+                            self.logger.info(
+                                "Resume reused merge group %s with %d segment(s) [%.3f - %.3f]",
+                                resolved_group_id if resolved_group_id is not None else "?",
+                                len(group_segment_ids),
+                                group.start_s,
+                                group.end_s,
+                            )
+                        else:
+                            self.logger.debug(
+                                "Resume reused merge group %s with %d segment(s) [%.3f - %.3f]",
+                                resolved_group_id if resolved_group_id is not None else "?",
+                                len(group_segment_ids),
+                                group.start_s,
+                                group.end_s,
+                            )
+                        report_progress(
+                            "demucs_progress",
+                            total_segments=len(timeline),
+                            completed_segments=len(result_segments),
+                            resumed_segments=resumed_segments,
+                            processed_segments=processed_segments,
+                            error_segments=pending_error_segments,
                         )
                         index = group.end_index + 1
                         continue
+                    before_len = len(result_segments)
                     self._process_group(
                         group,
                         timeline,
@@ -1165,6 +1199,19 @@ class EnhancedPipeline:
                         result_segments,
                         merge_groups,
                     )
+                    new_entries = result_segments[before_len:]
+                    processed_segments += len(new_entries)
+                    pending_error_segments += sum(
+                        1 for entry in new_entries if entry.get("enhanced_action") == "error"
+                    )
+                    report_progress(
+                        "demucs_progress",
+                        total_segments=len(timeline),
+                        completed_segments=len(result_segments),
+                        resumed_segments=resumed_segments,
+                        processed_segments=processed_segments,
+                        error_segments=pending_error_segments,
+                    )
                     next_group_id += 1
                     index = group.end_index + 1
                     continue
@@ -1174,14 +1221,30 @@ class EnhancedPipeline:
                     resumed_entry = copy.deepcopy(reusable_segments[segment_id])
                     result_segments.append(resumed_entry)
                     resumed_segments += 1
-                    self.logger.info(
-                        "Resume reused segment %d (%s)",
-                        segment_id,
-                        resumed_entry.get("enhanced_action"),
+                    if progress_callback is None:
+                        self.logger.info(
+                            "Resume reused segment %d (%s)",
+                            segment_id,
+                            resumed_entry.get("enhanced_action"),
+                        )
+                    else:
+                        self.logger.debug(
+                            "Resume reused segment %d (%s)",
+                            segment_id,
+                            resumed_entry.get("enhanced_action"),
+                        )
+                    report_progress(
+                        "demucs_progress",
+                        total_segments=len(timeline),
+                        completed_segments=len(result_segments),
+                        resumed_segments=resumed_segments,
+                        processed_segments=processed_segments,
+                        error_segments=pending_error_segments,
                     )
                     index += 1
                     continue
 
+                before_len = len(result_segments)
                 self._process_single_segment(
                     timeline[index],
                     container,
@@ -1192,6 +1255,19 @@ class EnhancedPipeline:
                     write_executor,
                     pending_writes,
                     result_segments,
+                )
+                new_entries = result_segments[before_len:]
+                processed_segments += len(new_entries)
+                pending_error_segments += sum(
+                    1 for entry in new_entries if entry.get("enhanced_action") == "error"
+                )
+                report_progress(
+                    "demucs_progress",
+                    total_segments=len(timeline),
+                    completed_segments=len(result_segments),
+                    resumed_segments=resumed_segments,
+                    processed_segments=processed_segments,
+                    error_segments=pending_error_segments,
                 )
                 index += 1
 
@@ -1219,6 +1295,21 @@ class EnhancedPipeline:
             write_executor.shutdown(wait=True)
             container.close()
             counts = Counter(seg.get("enhanced_action", "unknown") for seg in result_segments)
+            self.logger.info(
+                "Processing complete: %d newly processed, %d resumed, %d total. Actions: %s",
+                processed_segments,
+                resumed_segments,
+                len(result_segments),
+                ", ".join(f"{action}={count}" for action, count in sorted(counts.items())),
+            )
+            report_progress(
+                "demucs_summary",
+                total_segments=len(result_segments),
+                resumed_segments=resumed_segments,
+                processed_segments=processed_segments,
+                error_segments=counts.get("error", 0),
+                counts=dict(counts),
+            )
 
             manifest = {
                 "source_manifest": str(segments_json_path),
