@@ -88,6 +88,11 @@ def build_parser():
         help="Disable progress bar.",
     )
     parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Reuse completed segment outputs from an existing partial enhanced manifest when possible.",
+    )
+    parser.add_argument(
         "--no_merge_adjacent",
         action="store_true",
         help="Disable adjacent separation-segment merging.",
@@ -161,6 +166,7 @@ def main():
         segment=args.segment,
         jobs=args.jobs,
         progress=not args.no_progress,
+        resume=args.resume,
         merge_adjacent_separation=not args.no_merge_adjacent,
         merge_gap_s=args.merge_gap_s,
         merge_max_duration_s=args.merge_max_duration_s,

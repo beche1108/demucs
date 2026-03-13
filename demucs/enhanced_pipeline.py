@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import concurrent.futures
+import copy
 import dataclasses
 import json
 import logging
+import os
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -21,6 +24,7 @@ logger = logging.getLogger(__name__)
 DEMUCS_SAMPLE_RATE = 44100
 DEFAULT_OUTPUT_SAMPLE_RATE = 16000
 MIN_SEGMENT_DURATION = 0.05  # seconds; segments shorter than this are skipped
+RESUME_RUNTIME_CONFIG_FIELDS = {"jobs", "progress", "resume", "use_gpu"}
 
 
 class _PrefixLoggerAdapter(logging.LoggerAdapter):
@@ -97,6 +101,76 @@ def _segment_duration(seg: dict) -> float:
 
 def _manifest_relative_path(path: Path, base_dir: Path) -> str:
     return path.relative_to(base_dir).as_posix()
+
+
+def _iter_manifest_path_candidates(path_value: str) -> list[Path]:
+    candidates = [Path(path_value)]
+    if "\\" in path_value:
+        candidates.append(Path(path_value.replace("\\", "/")))
+    if os.sep == "\\" and "/" in path_value:
+        candidates.append(Path(path_value.replace("/", "\\")))
+
+    unique_candidates = []
+    seen = set()
+    for candidate in candidates:
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique_candidates.append(candidate)
+    return unique_candidates
+
+
+def _resolve_manifest_reference(base_dir: Path, path_value: str | None) -> Path | None:
+    if not path_value:
+        return None
+
+    fallback = None
+    for candidate in _iter_manifest_path_candidates(path_value):
+        current = candidate if candidate.is_absolute() else (base_dir / candidate)
+        resolved = current.resolve()
+        if fallback is None:
+            fallback = resolved
+        if resolved.exists():
+            return resolved
+    return fallback
+
+
+def _normalize_jsonish(value):
+    if isinstance(value, dict):
+        return {str(key): _normalize_jsonish(inner) for key, inner in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_normalize_jsonish(inner) for inner in value]
+    return value
+
+
+def _normalized_resume_config(config: dict | None) -> dict:
+    normalized = _normalize_jsonish(config or {})
+    for field_name in RESUME_RUNTIME_CONFIG_FIELDS:
+        normalized.pop(field_name, None)
+    return normalized
+
+
+def _same_time(left: object, right: object, *, tol: float = 1e-6) -> bool:
+    try:
+        return abs(float(left) - float(right)) <= tol
+    except (TypeError, ValueError):
+        return False
+
+
+def _segment_entry_matches_timeline(segment_entry: dict, timeline_segment: dict) -> bool:
+    try:
+        segment_id = int(segment_entry.get("segment_id"))
+        timeline_segment_id = int(timeline_segment["segment_id"])
+    except (KeyError, TypeError, ValueError):
+        return False
+
+    return (
+        segment_id == timeline_segment_id
+        and segment_entry.get("original_label") == timeline_segment.get("label")
+        and _same_time(segment_entry.get("start"), timeline_segment.get("start"))
+        and _same_time(segment_entry.get("end"), timeline_segment.get("end"))
+    )
 
 
 def _resolve_output_sample_rate(audio_stream, configured_sample_rate: Optional[int]) -> int:
@@ -240,6 +314,7 @@ class EnhancedPipelineConfig:
     demucs_model: str = "htdemucs_ft"
     stem_mode: str = "two"
     use_gpu: bool = False
+    resume: bool = False
     labels_to_separate: tuple = ("speech_with_music", "singing", "uncertain")
     labels_to_passthrough: tuple = ("speech",)
     labels_to_skip: tuple = ("silence", "music")
@@ -357,6 +432,173 @@ class EnhancedPipeline:
             config = EnhancedPipelineConfig()
         processor = DemucsProcessor(config)
         return cls(processor, config)
+
+    def _required_resume_path_fields(self, seg_entry: dict) -> list[str] | None:
+        action = seg_entry.get("enhanced_action")
+        if action not in {"separated", "passthrough"}:
+            return None
+
+        required_fields = ["vocals_path"]
+        if action == "separated" and self.config.save_accompaniment:
+            if self.config.stem_mode == "two":
+                required_fields.append("accompaniment_path")
+            else:
+                non_vocal_fields = sorted(
+                    field_name
+                    for field_name, value in seg_entry.items()
+                    if field_name.endswith("_path")
+                    and field_name != "vocals_path"
+                    and value
+                )
+                if not non_vocal_fields:
+                    return None
+                required_fields.extend(non_vocal_fields)
+        return required_fields
+
+    def _is_resume_segment_entry_reusable(
+        self,
+        seg_entry: dict,
+        timeline_segment: dict,
+        output_dir: Path,
+    ) -> bool:
+        if not _segment_entry_matches_timeline(seg_entry, timeline_segment):
+            return False
+
+        action = seg_entry.get("enhanced_action")
+        if action == "error":
+            return False
+        if action == "skipped":
+            return True
+
+        required_fields = self._required_resume_path_fields(seg_entry)
+        if required_fields is None:
+            return False
+
+        for field_name in required_fields:
+            resolved = _resolve_manifest_reference(output_dir, seg_entry.get(field_name))
+            if resolved is None or not resolved.exists():
+                return False
+        return True
+
+    def _load_resume_state(
+        self,
+        *,
+        manifest_path: Path,
+        timeline: list[dict],
+        output_dir: Path,
+        resolved_output_sample_rate: int,
+    ) -> tuple[dict[int, dict], dict[int, dict], int]:
+        if not self.config.resume or not manifest_path.exists():
+            return {}, {}, 0
+
+        try:
+            with open(manifest_path, encoding="utf-8") as fin:
+                existing_manifest = json.load(fin)
+        except Exception as exc:
+            self.logger.warning(
+                "Failed to load existing Demucs manifest %s for resume. Reprocessing from scratch: %s",
+                manifest_path,
+                exc,
+            )
+            return {}, {}, 0
+
+        if not isinstance(existing_manifest, dict):
+            self.logger.warning(
+                "Existing Demucs manifest %s is not a JSON object. Reprocessing from scratch.",
+                manifest_path,
+            )
+            return {}, {}, 0
+
+        existing_config = _normalized_resume_config(existing_manifest.get("config"))
+        current_config = _normalized_resume_config(dataclasses.asdict(self.config))
+        if existing_config != current_config:
+            self.logger.warning(
+                "Existing Demucs manifest %s uses different settings. Reprocessing from scratch.",
+                manifest_path,
+            )
+            return {}, {}, 0
+
+        try:
+            existing_output_sample_rate = int(existing_manifest.get("output_sample_rate"))
+        except (TypeError, ValueError):
+            self.logger.warning(
+                "Existing Demucs manifest %s is missing a valid output_sample_rate. Reprocessing from scratch.",
+                manifest_path,
+            )
+            return {}, {}, 0
+        if existing_output_sample_rate != resolved_output_sample_rate:
+            self.logger.warning(
+                "Existing Demucs manifest %s uses output_sample_rate=%s, but the current run resolved %s. Reprocessing from scratch.",
+                manifest_path,
+                existing_output_sample_rate,
+                resolved_output_sample_rate,
+            )
+            return {}, {}, 0
+
+        existing_segments = existing_manifest.get("segments")
+        if not isinstance(existing_segments, list):
+            self.logger.warning(
+                "Existing Demucs manifest %s is missing a valid segments list. Reprocessing from scratch.",
+                manifest_path,
+            )
+            return {}, {}, 0
+
+        timeline_by_id = {
+            int(segment["segment_id"]): segment
+            for segment in timeline
+        }
+        reusable_segments: dict[int, dict] = {}
+        ignored_segments = 0
+        for seg_entry in existing_segments:
+            if not isinstance(seg_entry, dict):
+                ignored_segments += 1
+                continue
+            try:
+                segment_id = int(seg_entry.get("segment_id"))
+            except (TypeError, ValueError):
+                ignored_segments += 1
+                continue
+            timeline_segment = timeline_by_id.get(segment_id)
+            if timeline_segment is None:
+                ignored_segments += 1
+                continue
+            if not self._is_resume_segment_entry_reusable(seg_entry, timeline_segment, output_dir):
+                ignored_segments += 1
+                continue
+            reusable_segments[segment_id] = copy.deepcopy(seg_entry)
+
+        reusable_merge_groups: dict[int, dict] = {}
+        for merge_group in existing_manifest.get("merge_groups", []):
+            if not isinstance(merge_group, dict):
+                continue
+            try:
+                group_id = int(merge_group["group_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            reusable_merge_groups[group_id] = copy.deepcopy(merge_group)
+
+        reused_group_ids = set()
+        for seg_entry in reusable_segments.values():
+            try:
+                group_id = int(seg_entry["merge_group_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            reused_group_ids.add(group_id)
+
+        self.logger.info(
+            "Resume scan: reusable Demucs segments=%d/%d from %s",
+            len(reusable_segments),
+            len(timeline),
+            manifest_path,
+        )
+        if ignored_segments:
+            self.logger.info(
+                "Resume scan ignored %d existing segment entrie(s) due to errors, missing files, or metadata mismatch.",
+                ignored_segments,
+            )
+
+        next_group_id = max(reused_group_ids, default=-1) + 1
+        return reusable_segments, reusable_merge_groups, next_group_id
 
     def _make_segment_entry(self, seg: dict) -> dict:
         return {
@@ -830,6 +1072,7 @@ class EnhancedPipeline:
         segments_json_path = Path(segments_json_path)
         output_dir = Path(output_dir)
         segments_dir = output_dir / "segments"
+        manifest_path = output_dir / f"{segments_json_path.stem}.enhanced.json"
         output_dir.mkdir(parents=True, exist_ok=True)
         segments_dir.mkdir(parents=True, exist_ok=True)
 
@@ -851,6 +1094,10 @@ class EnhancedPipeline:
         timeline = source["timeline"]
         result_segments: list[dict] = []
         merge_groups: list[dict] = []
+        reusable_segments: dict[int, dict] = {}
+        reusable_merge_groups: dict[int, dict] = {}
+        reused_merge_group_ids: set[int] = set()
+        resumed_segments = 0
 
         container = av.open(str(input_path))
         audio_stream = next(iter(container.streams.audio), None)
@@ -861,16 +1108,50 @@ class EnhancedPipeline:
             audio_stream,
             config.output_sample_rate,
         )
+        reusable_segments, reusable_merge_groups, next_group_id = self._load_resume_state(
+            manifest_path=manifest_path,
+            timeline=timeline,
+            output_dir=output_dir,
+            resolved_output_sample_rate=resolved_output_sample_rate,
+        )
 
         write_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
         pending_writes: list[PendingSegmentWrite] = []
 
         try:
             index = 0
-            next_group_id = 0
             while index < len(timeline):
                 group = self._build_separation_group(timeline, index, next_group_id)
                 if group is not None:
+                    group_segment_ids = [
+                        int(timeline[group_index]["segment_id"])
+                        for group_index in range(group.start_index, group.end_index + 1)
+                    ]
+                    if all(segment_id in reusable_segments for segment_id in group_segment_ids):
+                        group_id = reusable_segments[group_segment_ids[0]].get("merge_group_id")
+                        try:
+                            resolved_group_id = int(group_id)
+                        except (TypeError, ValueError):
+                            resolved_group_id = None
+                        if (
+                            resolved_group_id is not None
+                            and resolved_group_id in reusable_merge_groups
+                            and resolved_group_id not in reused_merge_group_ids
+                        ):
+                            merge_groups.append(copy.deepcopy(reusable_merge_groups[resolved_group_id]))
+                            reused_merge_group_ids.add(resolved_group_id)
+                        for segment_id in group_segment_ids:
+                            result_segments.append(copy.deepcopy(reusable_segments[segment_id]))
+                            resumed_segments += 1
+                        self.logger.info(
+                            "Resume reused merge group %s with %d segment(s) [%.3f - %.3f]",
+                            resolved_group_id if resolved_group_id is not None else "?",
+                            len(group_segment_ids),
+                            group.start_s,
+                            group.end_s,
+                        )
+                        index = group.end_index + 1
+                        continue
                     self._process_group(
                         group,
                         timeline,
@@ -886,6 +1167,19 @@ class EnhancedPipeline:
                     )
                     next_group_id += 1
                     index = group.end_index + 1
+                    continue
+
+                segment_id = int(timeline[index]["segment_id"])
+                if segment_id in reusable_segments:
+                    resumed_entry = copy.deepcopy(reusable_segments[segment_id])
+                    result_segments.append(resumed_entry)
+                    resumed_segments += 1
+                    self.logger.info(
+                        "Resume reused segment %d (%s)",
+                        segment_id,
+                        resumed_entry.get("enhanced_action"),
+                    )
+                    index += 1
                     continue
 
                 self._process_single_segment(
@@ -924,6 +1218,7 @@ class EnhancedPipeline:
                     pending.entry["enhanced_action"] = pending.success_action
             write_executor.shutdown(wait=True)
             container.close()
+            counts = Counter(seg.get("enhanced_action", "unknown") for seg in result_segments)
 
             manifest = {
                 "source_manifest": str(segments_json_path),
@@ -932,11 +1227,17 @@ class EnhancedPipeline:
                 "stem_mode": config.stem_mode,
                 "output_sample_rate": resolved_output_sample_rate,
                 "config": dataclasses.asdict(config),
+                "counts": dict(counts),
+                "resume": {
+                    "enabled": bool(config.resume),
+                    "reused_segments": resumed_segments,
+                    "processed_segments": max(0, len(result_segments) - resumed_segments),
+                },
                 "merge_groups": merge_groups,
                 "segments": result_segments,
+                "manifest_path": str(manifest_path),
             }
 
-            manifest_path = output_dir / f"{segments_json_path.stem}.enhanced.json"
             with open(manifest_path, "w", encoding="utf-8") as f:
                 json.dump(manifest, f, indent=2, ensure_ascii=False)
 
