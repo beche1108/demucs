@@ -23,6 +23,14 @@ DEFAULT_OUTPUT_SAMPLE_RATE = 16000
 MIN_SEGMENT_DURATION = 0.05  # seconds; segments shorter than this are skipped
 
 
+class _PrefixLoggerAdapter(logging.LoggerAdapter):
+    def process(self, msg, kwargs):
+        prefix = self.extra.get("prefix", "")
+        if prefix:
+            msg = f"{prefix}{msg}"
+        return msg, kwargs
+
+
 class SegmentSkipError(ValueError):
     def __init__(self, reason: str, message: str):
         super().__init__(message)
@@ -341,6 +349,7 @@ class EnhancedPipeline:
     def __init__(self, processor: DemucsProcessor, config: EnhancedPipelineConfig):
         self.processor = processor
         self.config = config
+        self.logger = _PrefixLoggerAdapter(logger, {"prefix": ""})
 
     @classmethod
     def from_config(cls, config: Optional[EnhancedPipelineConfig] = None) -> EnhancedPipeline:
@@ -537,9 +546,9 @@ class EnhancedPipeline:
                     write_executor,
                     pending_writes,
                 )
-                logger.debug("Segment %d (%s): passthrough", seg_id, label)
+                self.logger.debug("Segment %d (%s): passthrough", seg_id, label)
             elif label in config.labels_to_separate:
-                logger.info(
+                self.logger.info(
                     "Segment %d (%s): separating [%.3f - %.3f]",
                     seg_id, label, start_s, end_s,
                 )
@@ -563,14 +572,14 @@ class EnhancedPipeline:
                     pending_writes,
                 )
             else:
-                logger.warning("Segment %d: unhandled label '%s', skipping", seg_id, label)
+                self.logger.warning("Segment %d: unhandled label '%s', skipping", seg_id, label)
                 seg_entry["enhanced_action"] = "skipped"
         except SegmentSkipError as e:
-            logger.info("Segment %d skipped: %s", seg_id, e)
+            self.logger.info("Segment %d skipped: %s", seg_id, e)
             seg_entry["enhanced_action"] = "skipped"
             seg_entry["skip_reason"] = e.reason
         except Exception as e:
-            logger.warning("Segment %d failed: %s", seg_id, e)
+            self.logger.warning("Segment %d failed (%s): %s", seg_id, type(e).__name__, e)
             seg_entry["enhanced_action"] = "error"
             seg_entry["error"] = str(e)
 
@@ -711,7 +720,7 @@ class EnhancedPipeline:
             ],
         }
 
-        logger.info(
+        self.logger.info(
             "Merge group %d: separating %d segment(s) [%.3f - %.3f]",
             group.group_id,
             len(group.member_indices),
@@ -733,9 +742,10 @@ class EnhancedPipeline:
             merge_record["status"] = "fallback_individual"
             merge_record["error"] = str(e)
             merge_groups.append(merge_record)
-            logger.warning(
-                "Merge group %d failed, falling back to per-segment processing: %s",
+            self.logger.warning(
+                "Merge group %d failed (%s), falling back to per-segment processing: %s",
                 group.group_id,
+                type(e).__name__,
                 e,
             )
             self._fallback_group_to_individual(
@@ -788,7 +798,7 @@ class EnhancedPipeline:
                         pending_writes,
                     )
                 except SegmentSkipError as e:
-                    logger.info(
+                    self.logger.info(
                         "Segment %d skipped after merged separation: %s",
                         seg["segment_id"],
                         e,
@@ -796,7 +806,7 @@ class EnhancedPipeline:
                     seg_entry["enhanced_action"] = "skipped"
                     seg_entry["skip_reason"] = e.reason
                 except Exception as e:
-                    logger.warning(
+                    self.logger.warning(
                         "Segment %d failed after merged separation: %s",
                         seg["segment_id"],
                         e,
@@ -834,7 +844,8 @@ class EnhancedPipeline:
                 "Pass --input_path to specify the correct location."
             )
 
-        logger.info("Source media: %s", input_path)
+        self.logger.extra["prefix"] = f"[{Path(str(input_path)).name}] "
+        self.logger.info("Source media: %s", input_path)
 
         config = self.config
         timeline = source["timeline"]
@@ -902,7 +913,7 @@ class EnhancedPipeline:
                         pending.entry[write.path_field] = write.relative_path
                         pending.entry.update(write.extra_fields)
                 if errors:
-                    logger.warning(
+                    self.logger.warning(
                         "Segment %s WAV write failed: %s",
                         pending.entry["segment_id"],
                         "; ".join(errors),
@@ -929,6 +940,6 @@ class EnhancedPipeline:
             with open(manifest_path, "w", encoding="utf-8") as f:
                 json.dump(manifest, f, indent=2, ensure_ascii=False)
 
-            logger.info("Enhanced manifest saved to %s", manifest_path)
+            self.logger.info("Enhanced manifest saved to %s", manifest_path)
 
         return manifest
