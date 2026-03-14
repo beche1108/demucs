@@ -76,14 +76,19 @@ def _as_label_tuple(value) -> tuple:
     return tuple(value)
 
 
-def _to_mono_numpy(wav: torch.Tensor, context: str) -> np.ndarray:
-    audio = wav.detach().cpu().numpy()
+def _to_mono_audio_tensor(wav: torch.Tensor, context: str) -> torch.Tensor:
+    audio = wav.detach()
     if audio.ndim == 2:
         if audio.shape[0] != 1:
             raise ValueError(f"{context} must be mono, got shape {tuple(audio.shape)}")
         audio = audio[0]
     elif audio.ndim != 1:
         raise ValueError(f"{context} must be 1D or (1, N), got shape {tuple(audio.shape)}")
+    return audio.contiguous()
+
+
+def _to_mono_numpy(wav: torch.Tensor, context: str) -> np.ndarray:
+    audio = _to_mono_audio_tensor(wav, context).cpu().numpy()
     return np.ascontiguousarray(audio)
 
 
@@ -198,13 +203,13 @@ def _resolve_output_sample_rate(audio_stream, configured_sample_rate: Optional[i
 
 
 def _slice_audio_window(
-    audio: np.ndarray,
+    audio: torch.Tensor | np.ndarray,
     sample_rate: int,
     start_s: float,
     end_s: float,
     window_start_s: float,
     context: str,
-) -> np.ndarray:
+) -> torch.Tensor | np.ndarray:
     start_idx = max(0, int(round((start_s - window_start_s) * sample_rate)))
     end_idx = min(audio.shape[-1], int(round((end_s - window_start_s) * sample_rate)))
     if end_idx <= start_idx:
@@ -212,14 +217,17 @@ def _slice_audio_window(
             "empty_after_group_slice",
             f"{context} has no samples for [{start_s:.3f}, {end_s:.3f}]",
         )
-    sliced = np.ascontiguousarray(audio[start_idx:end_idx])
+    sliced = audio[..., start_idx:end_idx]
+    sample_count = int(sliced.shape[-1])
     min_samples = max(1, int(sample_rate * MIN_SEGMENT_DURATION))
-    if sliced.size < min_samples:
+    if sample_count < min_samples:
         raise SegmentSkipError(
             "too_short_after_group_slice",
-            f"{context} has only {sliced.size} samples for [{start_s:.3f}, {end_s:.3f}]",
+            f"{context} has only {sample_count} samples for [{start_s:.3f}, {end_s:.3f}]",
         )
-    return sliced
+    if isinstance(sliced, torch.Tensor):
+        return sliced.contiguous()
+    return np.ascontiguousarray(sliced)
 
 
 def _extract_audio_av(
@@ -385,9 +393,9 @@ class DemucsProcessor:
                 f"Model '{self.config.demucs_model}' does not provide a 'vocals' stem. "
                 f"Available stems: {sorted(stems)}"
             )
-        processed_stems: dict[str, np.ndarray] = {}
+        processed_stems: dict[str, torch.Tensor] = {}
         vocals_mono = convert_audio(stems["vocals"], DEMUCS_SAMPLE_RATE, output_sample_rate, 1)
-        processed_stems["vocals"] = _to_mono_numpy(vocals_mono, "vocals output")
+        processed_stems["vocals"] = _to_mono_audio_tensor(vocals_mono, "vocals output")
 
         non_vocal_names = [name for name in stems if name != "vocals"]
         if self.config.stem_mode == "two":
@@ -405,14 +413,14 @@ class DemucsProcessor:
                 output_sample_rate,
                 1,
             )
-            processed_stems["accompaniment"] = _to_mono_numpy(
+            processed_stems["accompaniment"] = _to_mono_audio_tensor(
                 accompaniment_mono,
                 "accompaniment output",
             )
         else:
             for name in non_vocal_names:
                 stem_mono = convert_audio(stems[name], DEMUCS_SAMPLE_RATE, output_sample_rate, 1)
-                processed_stems[name] = _to_mono_numpy(stem_mono, f"{name} output")
+                processed_stems[name] = _to_mono_audio_tensor(stem_mono, f"{name} output")
 
         return {
             "stems": processed_stems,
@@ -669,14 +677,15 @@ class EnhancedPipeline:
         self,
         seg_entry: dict,
         seg_id: int,
-        stems_np: dict[str, np.ndarray],
+        stems_tensors: dict[str, torch.Tensor],
         sample_rate: int,
         output_dir: Path,
         segments_dir: Path,
         write_executor,
         pending_writes: list[PendingSegmentWrite],
     ) -> None:
-        vocals_np = stems_np["vocals"]
+        vocals_tensor = stems_tensors["vocals"]
+        vocals_np = _to_mono_numpy(vocals_tensor, "vocals output")
         vocals_path = segments_dir / f"{seg_id:04d}_vocals.wav"
         segment_writes = [
             PendingWrite(
@@ -694,23 +703,24 @@ class EnhancedPipeline:
             )
         ]
         if self.config.save_accompaniment:
-            for stem_name, stem_audio in stems_np.items():
+            for stem_name, stem_audio in stems_tensors.items():
                 if stem_name == "vocals":
                     continue
+                stem_np = _to_mono_numpy(stem_audio, f"{stem_name} output")
                 stem_path = segments_dir / f"{seg_id:04d}_{stem_name}.wav"
                 segment_writes.append(
                     PendingWrite(
                         future=write_executor.submit(
                             sf.write,
                             str(stem_path),
-                            stem_audio,
+                            stem_np,
                             sample_rate,
                         ),
                         path_field=f"{stem_name}_path",
                         relative_path=_manifest_relative_path(stem_path, output_dir),
                         extra_fields={
                             f"{stem_name}_rms": _compute_rms(
-                                stem_audio,
+                                stem_np,
                                 f"{stem_name} output",
                             )
                         },
